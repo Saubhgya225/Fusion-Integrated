@@ -102,6 +102,17 @@ def apply_leave(
     if category not in ALL_LEAVE_CATEGORIES:
         raise ConflictError(f"Invalid leave category: {category}")
 
+    # Station leave validation (BR-EL-013)
+    if station_leave:
+        if not station_start_date or not station_end_date:
+            raise ConflictError("Station leave requires both departure and return dates.")
+        if station_start_date > station_end_date:
+            raise ConflictError("Station leave departure date cannot be after return date.")
+        if station_start_date > start_date or station_end_date < end_date:
+            raise ConflictError("Station leave period must cover the entire leave interval.")
+        if not station_address.strip() or not station_contact.strip():
+            raise ConflictError("Station leave requires outstation contact address and emergency contact phone.")
+
     ensure_user_balances(user_id, kind="faculty" if category == LEAVE_VL else "staff", year=year)
     closed, restricted, vacation = _get_calendar_data(start_date.year)
 
@@ -219,7 +230,7 @@ def review_unit_head(
     req.unit_head_decision = decision
     req.unit_head_remarks = remarks
 
-    # CL and RH final sanction by Unit Head
+    # CL and RH final sanction by Unit Head (BR-EL-016)
     if req.category in (LEAVE_CL, LEAVE_RH):
         if decision == DECISION_APPROVE:
             req.status = STATUS_APPROVED
@@ -227,7 +238,12 @@ def review_unit_head(
         else:
             req.status = STATUS_REJECTED
     else:
-        # SCL, EL, COL, VL advance to higher sanction
+        # SCL, EL, COL, VL advance to higher sanction (BR-EL-017, BR-EL-018)
+        # Unit Head cannot make the final rejection decision for these categories
+        if decision == DECISION_REJECT:
+            raise ConflictError(
+                "Unit Head cannot reject SCL, EL, COL, or VL directly; they may only recommend or not recommend."
+            )
         req.status = STATUS_AWAITING_FINAL_SANCTION
 
     req.save()
@@ -377,6 +393,10 @@ def submit_extension(
         raise NotFoundError("Parent leave not found.")
     if not can_extend(parent.category, parent.status):
         raise ConflictError("Extensions are only allowed for ongoing EL, COL, or VL.")
+    if extension_start <= parent.end_date:
+        raise ConflictError(
+            f"Extension start date must be strictly after parent leave end date ({parent.end_date})."
+        )
 
     ext_req = apply_leave(
         user_id=user_id,
@@ -496,6 +516,20 @@ def process_year_end(year: int) -> None:
                 el_bal.credited += converted_el
                 el_bal.balance += converted_el
                 el_bal.save()
+
+    # 3. Carry forward EL and COL balances to next calendar year (BR-EL-005, BR-EL-008, BR-EL-009)
+    next_year = year + 1
+    for bal in LeaveBalance.objects.filter(year=year, category__in=[LEAVE_EL, LEAVE_COL]):
+        if bal.balance > Decimal("0.0"):
+            next_bal, created = LeaveBalance.objects.get_or_create(
+                user_id=bal.user_id,
+                year=next_year,
+                category=bal.category,
+                defaults={"credited": bal.balance, "balance": bal.balance},
+            )
+            if not created:
+                next_bal.balance += bal.balance
+                next_bal.save()
 
 
 def _deduct_leave_balance(user_id: int, year: int, category: str, days: Decimal) -> None:

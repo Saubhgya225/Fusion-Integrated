@@ -6,12 +6,15 @@ from django.test import TestCase
 from core.api.exceptions import ConflictError
 from modules.leave.domain.constants import (
     DECISION_APPROVE,
+    DECISION_NOT_RECOMMEND,
     DECISION_RECOMMEND,
     DECISION_REJECT,
     HALF_DAY_FIRST,
     HALF_DAY_SECOND,
     LEAVE_CL,
+    LEAVE_COL,
     LEAVE_EL,
+    LEAVE_SCL,
     LEAVE_VL,
     STATUS_APPROVED,
     STATUS_AWAITING_DIRECTOR_SELF_SANCTION,
@@ -142,6 +145,101 @@ class TestLeaveServices(TestCase):
         el_bal = LeaveBalance.objects.get(user_id=self.emp_id, year=2026, category=LEAVE_EL)
         self.assertEqual(el_bal.balance, Decimal("27.0"))
 
+    def test_unit_head_cannot_reject_el_or_scl_directly(self):
+        """BR-EL-017: Unit Head does not make final rejection decision for SCL/EL/COL/VL."""
+        start = date(2026, 11, 16)
+        end = date(2026, 11, 18)
+        req = apply_leave(
+            user_id=self.emp_id,
+            category=LEAVE_EL,
+            start_date=start,
+            end_date=end,
+            purpose="Vacation",
+        )
+        with self.assertRaises(ConflictError):
+            review_unit_head(req.pk, self.reviewer_id, decision=DECISION_REJECT)
+
+    def test_station_leave_validation(self):
+        """BR-EL-013: Station Leave date coverage and contact details validation."""
+        start = date(2026, 11, 16)
+        end = date(2026, 11, 18)
+
+        # Missing dates
+        with self.assertRaises(ConflictError):
+            apply_leave(
+                user_id=self.emp_id,
+                category=LEAVE_CL,
+                start_date=start,
+                end_date=end,
+                purpose="Trip",
+                station_leave=True,
+            )
+
+        # Station dates do not cover leave range
+        with self.assertRaises(ConflictError):
+            apply_leave(
+                user_id=self.emp_id,
+                category=LEAVE_CL,
+                start_date=start,
+                end_date=end,
+                purpose="Trip",
+                station_leave=True,
+                station_start_date=date(2026, 11, 17),  # starts after leave start
+                station_end_date=end,
+                station_address="Hotel Delhi",
+                station_contact="9876543210",
+            )
+
+        # Valid station leave
+        req = apply_leave(
+            user_id=self.emp_id,
+            category=LEAVE_CL,
+            start_date=start,
+            end_date=end,
+            purpose="Trip",
+            station_leave=True,
+            station_start_date=date(2026, 11, 15),
+            station_end_date=date(2026, 11, 19),
+            station_address="Hotel Delhi",
+            station_contact="9876543210",
+        )
+        self.assertTrue(req.station_leave)
+        self.assertEqual(req.station_address, "Hotel Delhi")
+
+    def test_extension_boundary_validation(self):
+        """BR-EL-025: Extension start date must be after parent leave end date."""
+        start = date(2026, 11, 16)
+        end = date(2026, 11, 18)
+        req = apply_leave(
+            user_id=self.emp_id,
+            category=LEAVE_EL,
+            start_date=start,
+            end_date=end,
+            purpose="Conference",
+        )
+        review_unit_head(req.pk, self.reviewer_id, decision=DECISION_RECOMMEND)
+        sanction_final(req.pk, self.director_id, decision=DECISION_APPROVE)
+
+        # Extension starting on or before end_date fails
+        with self.assertRaises(ConflictError):
+            submit_extension(
+                parent_leave_id=req.pk,
+                user_id=self.emp_id,
+                extension_start=end,
+                extension_end=date(2026, 11, 20),
+                purpose="Extended stay",
+            )
+
+        # Extension starting after end_date succeeds
+        ext = submit_extension(
+            parent_leave_id=req.pk,
+            user_id=self.emp_id,
+            extension_start=date(2026, 11, 19),
+            extension_end=date(2026, 11, 20),
+            purpose="Extended stay",
+        )
+        self.assertEqual(ext.parent_leave_id, req.pk)
+
     def test_director_self_sanction_flow(self):
         """BR-EL-020: Director as applicant uses Director self-sanction flow."""
         ensure_user_balances(self.director_id, kind="faculty", year=2026)
@@ -241,7 +339,7 @@ class TestLeaveServices(TestCase):
         self.assertEqual(bal_after_closure, bal_after_approval + Decimal("2.0"))
 
     def test_year_end_processing(self):
-        """WF-EL-07, BR-EL-002, BR-EL-007: Year-end lapse of CL and 2:1 VL to EL conversion."""
+        """WF-EL-07, BR-EL-002, BR-EL-007: Year-end lapse of CL, 2:1 VL to EL conversion, and EL/COL carry-forward."""
         faculty_id = 501
         ensure_user_balances(faculty_id, kind="faculty", year=2026)
 
@@ -260,3 +358,7 @@ class TestLeaveServices(TestCase):
 
         el_bal = LeaveBalance.objects.get(user_id=faculty_id, year=2026, category=LEAVE_EL)
         self.assertEqual(el_bal.balance, Decimal("30.0"))
+
+        # EL carried forward into 2027
+        el_2027 = LeaveBalance.objects.get(user_id=faculty_id, year=2027, category=LEAVE_EL)
+        self.assertEqual(el_2027.balance, Decimal("30.0"))
